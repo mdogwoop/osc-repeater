@@ -1,12 +1,10 @@
-FROM golang:alpine AS builder
-ENV GO111MODULE on
-RUN apk add --no-cache git
-WORKDIR $GOPATH/src/github.com/CyCoreSystems/osc-repeater
+FROM rust:alpine AS builder
+RUN apk add --no-cache musl-dev
+WORKDIR /usr/src/osc-repeater
 COPY . .
-RUN go get -d -v
-RUN go build -o /go/bin/app
+RUN cargo build --release --bin osc-repeater
 
 FROM alpine
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /go/bin/app /go/bin/app
-ENTRYPOINT ["/go/bin/app"]
+COPY --from=builder /usr/src/osc-repeater/target/release/osc-repeater /usr/local/bin/osc-repeater
+ENTRYPOINT ["/usr/local/bin/osc-repeater"]
