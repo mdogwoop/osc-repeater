@@ -1,8 +1,9 @@
 use clap::Parser;
 use rosc::{encoder, OscPacket};
 use serde::{Deserialize, Serialize};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -51,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create distributor
     let (tx, rx) = mpsc::unbounded_channel();
-    let distributor = Distributor::new(config.targets)?;
+    let distributor = Distributor::new(config.targets).await?;
     
     // Spawn distributor task
     let _distributor_handle = tokio::spawn(async move {
@@ -79,21 +80,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_receiver(
     port: u16,
-    tx: mpsc::UnboundedSender<OscPacket>,
+    tx: mpsc::UnboundedSender<Arc<OscPacket>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("0.0.0.0:{}", port);
-    let socket = UdpSocket::bind(&addr)?;
+    let socket = UdpSocket::bind(&addr).await?;
     info!("Receiver listening on {}", addr);
 
     let mut buf = vec![0u8; rosc::decoder::MTU];
 
     loop {
-        match socket.recv_from(&mut buf) {
+        match socket.recv_from(&mut buf).await {
             Ok((size, _src)) => {
                 match rosc::decoder::decode_udp(&buf[..size]) {
                     Ok((_, packet)) => {
                         debug!("Received message: {:?}", packet);
-                        if let Err(e) = tx.send(packet) {
+                        if let Err(e) = tx.send(Arc::new(packet)) {
                             error!("Failed to send to distributor: {}", e);
                         }
                     }
@@ -114,20 +115,20 @@ struct Distributor {
 }
 
 impl Distributor {
-    fn new(targets: Vec<String>) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(targets: Vec<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let mut senders = Vec::new();
         for target in targets {
-            let sender = Arc::new(Sender::new(&target)?);
+            let sender = Arc::new(Sender::new(&target).await?);
             senders.push(sender);
         }
         Ok(Self { senders })
     }
 
-    async fn run(self, mut rx: mpsc::UnboundedReceiver<OscPacket>) {
+    async fn run(self, mut rx: mpsc::UnboundedReceiver<Arc<OscPacket>>) {
         while let Some(packet) = rx.recv().await {
             debug!("Distributing message: {:?}", packet);
             for sender in &self.senders {
-                sender.send(packet.clone());
+                sender.send(Arc::clone(&packet)).await;
             }
         }
     }
@@ -139,9 +140,9 @@ struct Sender {
 }
 
 impl Sender {
-    fn new(target: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(target: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let target_addr: SocketAddr = target.parse()?;
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
         info!("Starting new Sender to {}", target_addr);
         Ok(Self {
             socket,
@@ -149,11 +150,11 @@ impl Sender {
         })
     }
 
-    fn send(&self, packet: OscPacket) {
-        match encoder::encode(&packet) {
+    async fn send(&self, packet: Arc<OscPacket>) {
+        match encoder::encode(&*packet) {
             Ok(msg_buf) => {
                 debug!("Sending message to {}: {:?}", self.target, packet);
-                if let Err(e) = self.socket.send_to(&msg_buf, self.target) {
+                if let Err(e) = self.socket.send_to(&msg_buf, self.target).await {
                     error!("Failed to send to {}: {}", self.target, e);
                 }
             }
