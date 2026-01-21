@@ -56,12 +56,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (encoded_tx, encoded_rx) = mpsc::unbounded_channel();
     let distributor = Distributor::new(config.targets).await?;
-    
+
     // Spawn encoder task
     tokio::spawn(async move {
         encode_packets(rx, encoded_tx).await;
     });
-    
+
     // Spawn distributor task
     let _distributor_handle = tokio::spawn(async move {
         distributor.run(encoded_rx).await;
