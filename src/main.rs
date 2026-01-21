@@ -7,6 +7,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+const BUFFER_SIZE: usize = rosc::decoder::MTU;
+
 #[derive(Parser, Debug)]
 #[command(name = "osc-repeater")]
 #[command(about = "OSC message repeater", long_about = None)]
@@ -52,11 +54,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create distributor
     let (tx, rx) = mpsc::unbounded_channel();
+    let (encoded_tx, encoded_rx) = mpsc::unbounded_channel();
     let distributor = Distributor::new(config.targets).await?;
+    
+    // Spawn encoder task
+    tokio::spawn(async move {
+        encode_packets(rx, encoded_tx).await;
+    });
     
     // Spawn distributor task
     let _distributor_handle = tokio::spawn(async move {
-        distributor.run(rx).await;
+        distributor.run(encoded_rx).await;
     });
 
     // Create receivers for each listen port
@@ -78,6 +86,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn encode_packets(
+    mut rx: mpsc::UnboundedReceiver<Arc<OscPacket>>,
+    tx: mpsc::UnboundedSender<Arc<Vec<u8>>>,
+) {
+    while let Some(packet) = rx.recv().await {
+        match encoder::encode(&*packet) {
+            Ok(msg_buf) => {
+                if let Err(e) = tx.send(Arc::new(msg_buf)) {
+                    error!("Failed to send encoded packet: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to encode OSC packet: {}", e);
+            }
+        }
+    }
+}
+
 async fn run_receiver(
     port: u16,
     tx: mpsc::UnboundedSender<Arc<OscPacket>>,
@@ -86,7 +112,7 @@ async fn run_receiver(
     let socket = UdpSocket::bind(&addr).await?;
     info!("Receiver listening on {}", addr);
 
-    let mut buf = vec![0u8; rosc::decoder::MTU];
+    let mut buf = vec![0u8; BUFFER_SIZE];
 
     loop {
         match socket.recv_from(&mut buf).await {
@@ -124,11 +150,11 @@ impl Distributor {
         Ok(Self { senders })
     }
 
-    async fn run(self, mut rx: mpsc::UnboundedReceiver<Arc<OscPacket>>) {
-        while let Some(packet) = rx.recv().await {
-            debug!("Distributing message: {:?}", packet);
+    async fn run(self, mut rx: mpsc::UnboundedReceiver<Arc<Vec<u8>>>) {
+        while let Some(msg_buf) = rx.recv().await {
+            debug!("Distributing encoded message ({} bytes)", msg_buf.len());
             for sender in &self.senders {
-                sender.send(Arc::clone(&packet)).await;
+                sender.send(Arc::clone(&msg_buf)).await;
             }
         }
     }
@@ -150,17 +176,10 @@ impl Sender {
         })
     }
 
-    async fn send(&self, packet: Arc<OscPacket>) {
-        match encoder::encode(&*packet) {
-            Ok(msg_buf) => {
-                debug!("Sending message to {}: {:?}", self.target, packet);
-                if let Err(e) = self.socket.send_to(&msg_buf, self.target).await {
-                    error!("Failed to send to {}: {}", self.target, e);
-                }
-            }
-            Err(e) => {
-                error!("Failed to encode OSC packet: {}", e);
-            }
+    async fn send(&self, msg_buf: Arc<Vec<u8>>) {
+        debug!("Sending message to {} ({} bytes)", self.target, msg_buf.len());
+        if let Err(e) = self.socket.send_to(&msg_buf, self.target).await {
+            error!("Failed to send to {}: {}", self.target, e);
         }
     }
 }
