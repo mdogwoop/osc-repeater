@@ -1,2 +1,6 @@
 /osc-repeater
 /send/send
+
+# Rust build artifacts
+/target
+Cargo.lock
